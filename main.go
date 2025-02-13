@@ -38,9 +38,32 @@ type GPUData struct {
 	GPUUtilPercent  int64
 }
 
-type Collector interface {
-	Collect(context.Context) ([]GPUData, error)
+// DynologData now matches the JSON types exactly. For numeric fields in quotes,
+// we use `,string` so Unmarshal succeeds. For numeric fields without quotes, we
+// omit `,string`.
+type DynologData struct {
+	DCGMError           int64   `json:"dcgm_error"`
+	Device              int64   `json:"device"`
+	FP16Active          float64 `json:"fp16_active,string"`
+	FP32Active          float64 `json:"fp32_active,string"`
+	FP64Active          float64 `json:"fp64_active,string"`
+	GPUFreqMHz          float64 `json:"gpu_frequency_mhz"`
+	GPUMemoryUtil       float64 `json:"gpu_memory_utilization"`
+	GPUPowerDraw        float64 `json:"gpu_power_draw,string"`
+	GraphicsActiveRatio float64 `json:"graphics_engine_active_ratio,string"`
+	HbmMemBWUtil        float64 `json:"hbm_mem_bw_util,string"`
+	NvlinkRxBytes       int64   `json:"nvlink_rx_bytes"`
+	NvlinkTxBytes       int64   `json:"nvlink_tx_bytes"`
+	PcieRxBytes         int64   `json:"pcie_rx_bytes"`
+	PcieTxBytes         int64   `json:"pcie_tx_bytes"`
+	SmActiveRatio       float64 `json:"sm_active_ratio,string"`
+	SmOccupancy         float64 `json:"sm_occupancy,string"`
+	TensorcoreActive    float64 `json:"tensorcore_active,string"`
 }
+
+// -----------------------------------------------------------------------------
+// NVIDIA SMI Collector
+// -----------------------------------------------------------------------------
 
 type NvidiaSMICollector struct{}
 
@@ -78,20 +101,25 @@ func (c *NvidiaSMICollector) Collect(ctx context.Context) ([]GPUData, error) {
 	return results, nil
 }
 
-// Dynolog logs are all on stderr. We'll parse lines containing "data = { ... }".
+// -----------------------------------------------------------------------------
+// Dynolog Collector
+// -----------------------------------------------------------------------------
+
+// Regex capturing JSON after `data =`
+var dataRegex = regexp.MustCompile(`data\s*=\s*(\{.*)$`)
+
 type DynologCollector struct {
 	cmd     *exec.Cmd
 	scanner *bufio.Scanner
 }
-
-// Regex capturing JSON after `data =`
-var dataRegex = regexp.MustCompile(`data\s*=\s*(\{.*)$`)
 
 func (c *DynologCollector) Start(ctx context.Context) error {
 	c.cmd = exec.CommandContext(ctx, "dynolog",
 		"--enable_gpu_monitor",
 		"--dcgm_lib_path=/lib/x86_64-linux-gnu/libdcgm.so.4",
 		"--use_JSON",
+		"--dcgm_reporting_interval_s",
+		"1",
 	)
 	stderr, err := c.cmd.StderrPipe()
 	if err != nil {
@@ -100,48 +128,31 @@ func (c *DynologCollector) Start(ctx context.Context) error {
 	if err := c.cmd.Start(); err != nil {
 		return err
 	}
-	// We'll scan stderr instead of stdout
 	c.scanner = bufio.NewScanner(stderr)
 	return nil
 }
 
-// Collect reads one line from stderr that has "data = { ... }" and parses it.
-func (c *DynologCollector) Collect(ctx context.Context) ([]GPUData, error) {
+func (c *DynologCollector) Collect(ctx context.Context) (DynologData, error) {
 	for c.scanner.Scan() {
 		line := c.scanner.Text()
-		fmt.Println(line) // tee everything to the console
-		matches := dataRegex.FindStringSubmatch(line)
-		if len(matches) < 2 {
-			// No JSON in this line, keep scanning
-			continue
+		fmt.Println(line) // tee entire line to console
+		if m := dataRegex.FindStringSubmatch(line); len(m) >= 2 {
+			var raw DynologData
+			if err := json.Unmarshal([]byte(m[1]), &raw); err != nil {
+				return DynologData{}, err
+			}
+			return raw, nil
 		}
-		rawJSON := matches[1]
-		var j map[string]interface{}
-		if err := json.Unmarshal([]byte(rawJSON), &j); err != nil {
-			return nil, fmt.Errorf("json parse error: %w", err)
-		}
-		id := fmt.Sprintf("%v", j["device"])
-		memUtil := parseOptionalFloat(j["gpu_memory_utilization"])
-		memUsed := int64(memUtil * 1024 * 1024)
-		util := parseOptionalFloat(j["sm_active_ratio"])
-		return []GPUData{{
-			ID:              id,
-			Name:            "DCGM-GPU",
-			MemoryUsedBytes: memUsed,
-			GPUUtilPercent:  int64(util * 100),
-		}}, nil
 	}
-	// If we exit the for-loop, scanner is done or no JSON found.
 	if err := c.scanner.Err(); err != nil {
-		return nil, fmt.Errorf("reading dynolog stderr: %w", err)
+		return DynologData{}, err
 	}
-	return nil, fmt.Errorf("no dynolog JSON lines found yet")
+	return DynologData{}, fmt.Errorf("no dynolog JSON lines found yet")
 }
 
-func parseOptionalFloat(val interface{}) float64 {
-	f, _ := strconv.ParseFloat(fmt.Sprintf("%v", val), 64)
-	return f
-}
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
 
 func parsePercentage(val string) (int64, error) {
 	s := strings.ReplaceAll(val, "%", "")
@@ -158,6 +169,10 @@ func parseMemory(val string) (int64, error) {
 	}
 	return num * 1024 * 1024, nil
 }
+
+// -----------------------------------------------------------------------------
+// Meter / Gauges
+// -----------------------------------------------------------------------------
 
 type meterWithGauges struct {
 	meter     metric.Meter
@@ -177,37 +192,70 @@ func newMeterWithGauges(m metric.Meter) (meterWithGauges, error) {
 	return meterWithGauges{m, memG, utilG}, nil
 }
 
-func registerCallback(m meterWithGauges, c Collector) error {
-	_, err := m.meter.RegisterCallback(
+// registerDynologCallback sets up instruments matching DynologData fields.
+func registerDynologCallback(m metric.Meter, c *DynologCollector) error {
+	dcgmErrGauge, _ := m.Int64ObservableGauge("dcgm.error")
+	nvlinkRxGauge, _ := m.Int64ObservableGauge("dcgm.nvlink_rx_bytes")
+	nvlinkTxGauge, _ := m.Int64ObservableGauge("dcgm.nvlink_tx_bytes")
+	pcieRxGauge, _ := m.Int64ObservableGauge("dcgm.pcie_rx_bytes")
+	pcieTxGauge, _ := m.Int64ObservableGauge("dcgm.pcie_tx_bytes")
+	fp16Gauge, _ := m.Float64ObservableGauge("dcgm.fp16_active_ratio")
+	fp32Gauge, _ := m.Float64ObservableGauge("dcgm.fp32_active_ratio")
+	fp64Gauge, _ := m.Float64ObservableGauge("dcgm.fp64_active_ratio")
+	freqGauge, _ := m.Float64ObservableGauge("dcgm.gpu_frequency_mhz")
+	memUtilGauge, _ := m.Float64ObservableGauge("dcgm.gpu_memory_util")
+	powerGauge, _ := m.Float64ObservableGauge("dcgm.gpu_power_draw_watts")
+	gfxRatioGauge, _ := m.Float64ObservableGauge("dcgm.graphics_engine_active_ratio")
+	hbmGauge, _ := m.Float64ObservableGauge("dcgm.hbm_mem_bw_util")
+	smActiveGauge, _ := m.Float64ObservableGauge("dcgm.sm_active_ratio")
+	smOccGauge, _ := m.Float64ObservableGauge("dcgm.sm_occupancy_ratio")
+	tensorGauge, _ := m.Float64ObservableGauge("dcgm.tensorcore_active_ratio")
+
+	_, err := m.RegisterCallback(
 		func(ctx context.Context, obs metric.Observer) error {
-			slog.Debug("Collecting metrics")
-			gpuData, err := c.Collect(ctx)
+			slog.Debug("Collecting dynolog metrics")
+			data, err := c.Collect(ctx)
 			if err != nil {
-				// Return error so it shows up in logs
 				return err
 			}
-			for _, g := range gpuData {
-				attrs := []attribute.KeyValue{
-					attribute.String("gpu_id", g.ID),
-					attribute.String("gpu_name", g.Name),
-				}
-				obs.ObserveInt64(m.memGauge, g.MemoryUsedBytes, metric.WithAttributes(attrs...))
-				obs.ObserveInt64(m.utilGauge, g.GPUUtilPercent, metric.WithAttributes(attrs...))
+			// Convert device int64 -> string for attribute
+			attrs := []attribute.KeyValue{
+				attribute.String("gpu_id", fmt.Sprintf("%d", data.Device)),
 			}
+			obs.ObserveInt64(dcgmErrGauge, data.DCGMError, metric.WithAttributes(attrs...))
+			obs.ObserveInt64(nvlinkRxGauge, data.NvlinkRxBytes, metric.WithAttributes(attrs...))
+			obs.ObserveInt64(nvlinkTxGauge, data.NvlinkTxBytes, metric.WithAttributes(attrs...))
+			obs.ObserveInt64(pcieRxGauge, data.PcieRxBytes, metric.WithAttributes(attrs...))
+			obs.ObserveInt64(pcieTxGauge, data.PcieTxBytes, metric.WithAttributes(attrs...))
+			obs.ObserveFloat64(fp16Gauge, data.FP16Active, metric.WithAttributes(attrs...))
+			obs.ObserveFloat64(fp32Gauge, data.FP32Active, metric.WithAttributes(attrs...))
+			obs.ObserveFloat64(fp64Gauge, data.FP64Active, metric.WithAttributes(attrs...))
+			obs.ObserveFloat64(freqGauge, data.GPUFreqMHz, metric.WithAttributes(attrs...))
+			obs.ObserveFloat64(memUtilGauge, data.GPUMemoryUtil, metric.WithAttributes(attrs...))
+			obs.ObserveFloat64(powerGauge, data.GPUPowerDraw, metric.WithAttributes(attrs...))
+			obs.ObserveFloat64(gfxRatioGauge, data.GraphicsActiveRatio, metric.WithAttributes(attrs...))
+			obs.ObserveFloat64(hbmGauge, data.HbmMemBWUtil, metric.WithAttributes(attrs...))
+			obs.ObserveFloat64(smActiveGauge, data.SmActiveRatio, metric.WithAttributes(attrs...))
+			obs.ObserveFloat64(smOccGauge, data.SmOccupancy, metric.WithAttributes(attrs...))
+			obs.ObserveFloat64(tensorGauge, data.TensorcoreActive, metric.WithAttributes(attrs...))
 			return nil
 		},
-		m.memGauge,
-		m.utilGauge,
+		dcgmErrGauge, nvlinkRxGauge, nvlinkTxGauge, pcieRxGauge, pcieTxGauge,
+		fp16Gauge, fp32Gauge, fp64Gauge, freqGauge, memUtilGauge,
+		powerGauge, gfxRatioGauge, hbmGauge, smActiveGauge, smOccGauge,
+		tensorGauge,
 	)
 	return err
 }
 
+// -----------------------------------------------------------------------------
+// OTel Provider Setup
+// -----------------------------------------------------------------------------
+
 func initProvider(ctx context.Context, cfg Config) (func(), error) {
 	res, err := resource.New(
 		ctx,
-		resource.WithAttributes(
-			semconv.ServiceName(cfg.ServiceName),
-		),
+		resource.WithAttributes(semconv.ServiceName(cfg.ServiceName)),
 	)
 	if err != nil {
 		return nil, err
@@ -215,9 +263,7 @@ func initProvider(ctx context.Context, cfg Config) (func(), error) {
 	exp, err := otlpmetricgrpc.New(
 		ctx,
 		otlpmetricgrpc.WithEndpoint("api.honeycomb.io:443"),
-		otlpmetricgrpc.WithHeaders(
-			map[string]string{"x-honeycomb-team": cfg.HoneycombKey},
-		),
+		otlpmetricgrpc.WithHeaders(map[string]string{"x-honeycomb-team": cfg.HoneycombKey}),
 	)
 	if err != nil {
 		return nil, err
@@ -236,7 +282,11 @@ func initProvider(ctx context.Context, cfg Config) (func(), error) {
 	}, nil
 }
 
-func runCollector(ctx context.Context, collector Collector, cfg Config) error {
+// -----------------------------------------------------------------------------
+// Runners
+// -----------------------------------------------------------------------------
+
+func runNvidiaSmiCollector(ctx context.Context, cfg Config) error {
 	shutdown, err := initProvider(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("init error: %w", err)
@@ -248,17 +298,49 @@ func runCollector(ctx context.Context, collector Collector, cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("gauge creation error: %w", err)
 	}
-	if err := registerCallback(mwg, collector); err != nil {
+	_, err = m.RegisterCallback(func(ctx context.Context, obs metric.Observer) error {
+		slog.Debug("Collecting nvidia-smi metrics")
+		data, err := (&NvidiaSMICollector{}).Collect(ctx)
+		if err != nil {
+			return err
+		}
+		for _, g := range data {
+			attrs := []attribute.KeyValue{
+				attribute.String("gpu_id", g.ID),
+				attribute.String("gpu_name", g.Name),
+			}
+			obs.ObserveInt64(mwg.memGauge, g.MemoryUsedBytes, metric.WithAttributes(attrs...))
+			obs.ObserveInt64(mwg.utilGauge, g.GPUUtilPercent, metric.WithAttributes(attrs...))
+		}
+		return nil
+	}, mwg.memGauge, mwg.utilGauge)
+	if err != nil {
 		return fmt.Errorf("callback registration error: %w", err)
 	}
-	slog.Info("Metrics collection running; Ctrl+C to exit.")
+	slog.Info("nvidia-smi metrics collection running; Ctrl+C to exit.")
 	<-ctx.Done()
 	return nil
 }
 
-// ----------------------------------------------------------------------------
+func runDynologCollector(ctx context.Context, cfg Config, dc *DynologCollector) error {
+	shutdown, err := initProvider(ctx, cfg)
+	if err != nil {
+		return fmt.Errorf("init error: %w", err)
+	}
+	defer shutdown()
+
+	m := otel.Meter("gpu-metrics")
+	if err := registerDynologCallback(m, dc); err != nil {
+		return fmt.Errorf("callback registration error: %w", err)
+	}
+	slog.Info("dynolog metrics collection running; Ctrl+C to exit.")
+	<-ctx.Done()
+	return nil
+}
+
+// -----------------------------------------------------------------------------
 // Cobra commands
-// ----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 
 var rootCmd = &cobra.Command{
 	Use: "gpu-metrics",
@@ -269,8 +351,7 @@ var nvidiaSmiCmd = &cobra.Command{
 	Short: "Collect GPU metrics via nvidia-smi",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := context.Background()
-		cfg := loadConfig()
-		return runCollector(ctx, &NvidiaSMICollector{}, cfg)
+		return runNvidiaSmiCollector(ctx, loadConfig())
 	},
 }
 
@@ -284,7 +365,7 @@ var dynologCmd = &cobra.Command{
 		if err := dc.Start(ctx); err != nil {
 			return fmt.Errorf("start dynolog: %w", err)
 		}
-		return runCollector(ctx, dc, cfg)
+		return runDynologCollector(ctx, cfg, dc)
 	},
 }
 

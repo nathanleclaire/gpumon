@@ -17,7 +17,7 @@ Features
 Prerequisites
 - Go
 - Ollama Server: Running locally (default address: http://localhost:11434).
-- Romance Corpus: A Parquet file (default: romance.parquet).
+- Corpus: A Parquet file (default: `romance.parquet`). This is hardcoded at the moment to the corpus at https://huggingface.co/datasets/AlekseyKorshuk/romance-books. Download the .parquet file and you can use this to generate the data.
 
 ## Usage
 

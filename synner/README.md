@@ -1,4 +1,4 @@
-Synner
+## Synner
 
 Synner is a command-line tool that generates synthetic ShareGPT-format data from
 a corpus. It reads a Parquet file containing romance literature, splits the text
@@ -19,7 +19,7 @@ Prerequisites
 - Ollama Server: Running locally (default address: http://localhost:11434).
 - Romance Corpus: A Parquet file (default: romance.parquet).
 
-Usage
+## Usage
 
 Build the binary:
 
@@ -40,15 +40,19 @@ Generate synthetic ShareGPT data from your romance corpus:
   --max-examples 1000
 ```
 
-Git Operations
+## Git Operations
 
 Create a new Git branch for dataset changes:
 
-./synner branch my-feature-branch
+```
+synner branch my-feature-branch
+```
 
 Commit dataset changes with a message:
 
-./synner commit "Generated new synthetic dataset"
+```
+synner commit "Generated new synthetic dataset"
+```
 
 Command Flags
  - --input-file: Path to the Parquet file (default: romance.parquet).
@@ -56,13 +60,3 @@ Command Flags
  - --model: Local model name in Ollama (default: llama2).
  - --ollama-addr: Ollama server address (default: http://localhost:11434).
  - --max-examples: Maximum number of examples to generate (default: 1000).
-
-Error Handling
-
-Synner logs errors for row reading, text generation, and Git operations. Invalid rows are skipped, and processing continues to ensure maximum dataset coverage.
-
-License
-
-[Specify license details here.]
-
-For questions or contributions, please open an issue or submit a pull request.

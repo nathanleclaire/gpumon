@@ -326,6 +326,7 @@ on the given literature excerpt:
 </literature>
 
 Key Requirements:
+- Emphasize a **romantic narrative**.
 - Attempt to understand the characters' names, relationships, and the context of the story.
 - Maintain consistent character voices and narrative flow throughout the conversation.
 - Include subtle relationship dynamics and tension.
@@ -424,6 +425,8 @@ Expected Output:
 
 	close(tokenCh)
 	<-done
+
+	fmt.Print("\n\n")
 
 	if err != nil {
 		return nil, err
